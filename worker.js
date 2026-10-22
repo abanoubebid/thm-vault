@@ -46,7 +46,6 @@ const json = (o, code = 200) =>
 async function getIndex(env) {
   let idx = await env.KV.get("index", "json");
   if (!idx) {
-    // one-time migration from older versions that kept metadata on each lesson key
     let keys = [], cursor;
     do {
       const r = await env.KV.list({ prefix: "lesson:", cursor });
@@ -116,6 +115,22 @@ async function saveLesson(env, text) {
   return { name, duplicate: false, message };
 }
 
+function extractMemorySummary(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  const blocks = [...text.matchAll(/```[^\n]*\n([\s\S]*?)```/g)];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i][1].trim();
+    if (/^###\s*Lesson:/m.test(block) && /الفكرة:/.test(block)) return block;
+  }
+  const index = text.lastIndexOf("### Lesson:");
+  if (index >= 0) {
+    const tail = text.slice(index).trim();
+    if (/الفكرة:/.test(tail)) return tail.replace(/^```[^\n]*\n?/, "").replace(/\n?```\s*$/, "").trim();
+  }
+  return "";
+}
+
 export default {
   async fetch(req, env) {
     const a = await authed(req, env);
@@ -145,7 +160,7 @@ export default {
         const m = r.metadata || {};
         return json({ name: m.n, date: m.d, time: m.t, text: r.value });
       }
-      if (req.method === "POST" && ["/api/lesson", "/api/settings", "/api/delete", "/api/message", "/api/rename"].includes(url.pathname)) {
+      if (req.method === "POST" && ["/api/lesson", "/api/settings", "/api/delete", "/api/message", "/api/rename", "/api/memory/import"].includes(url.pathname)) {
         const o = req.headers.get("Origin");
         if (o && o !== url.origin) return json({ error: "forbidden" }, 403);
         if (!(req.headers.get("Content-Type") || "").startsWith("application/json")) return json({ error: "json only" }, 415);
@@ -178,6 +193,20 @@ export default {
           const r = await saveLesson(env, text);
           return json({ ...r, state: await state(env) });
         }
+        if (url.pathname === "/api/memory/import") {
+          const summary = extractMemorySummary(body.text);
+          if (!summary) return json({ error: "summary_not_found" }, 400);
+          if (summary.length > 200000) return json({ error: "big" }, 413);
+          const current = ((await env.KV.get("memory")) || "").trim();
+          const lessonName = ((summary.match(/^###\s*Lesson:\s*(.+)$/m) || [])[1] || "").trim();
+          if (current.includes(summary)) return json({ ok: true, duplicate: true, state: await state(env) });
+          if (lessonName && current.split("\n").some((line) => line.trim() === "### Lesson: " + lessonName)) {
+            return json({ error: "lesson_exists", name: lessonName }, 409);
+          }
+          const combined = current ? current + "\n\n---\n\n" + summary : summary;
+          await env.KV.put("memory", combined);
+          return json({ ok: true, duplicate: false, name: lessonName, state: await state(env) });
+        }
         for (const k of ["prompt", "memory"]) {
           if (typeof body[k] === "string") {
             if (body[k].length > 200000) return json({ error: "big" }, 413);
@@ -194,10 +223,11 @@ export default {
   },
 };
 
+
 const PAGE = `<!DOCTYPE html>
 <html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Study Vault</title>
+<title>Study Vault</title><meta name="theme-color" content="#0a111d"><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230a111d'/%3E%3Cpath d='M14 18h36v7H14zm0 12h26v7H14zm0 12h32v7H14z' fill='%2300ff88'/%3E%3C/svg%3E">
 <style>
 :root{--bg:#0a111d;--pn:#101a2b;--ln:#1f2e47;--ink:#e6edf7;--mu:#8696b3;--info:#38bdf8;--ok:#34d399;--er:#f87171;--on:#04141f;color-scheme:dark}
 @media (prefers-color-scheme:light){:root{--bg:#eef2f8;--pn:#fff;--ln:#d0d9e8;--ink:#0f1b33;--mu:#566987;--info:#0369a1;--ok:#047857;--er:#b91c1c;--on:#fff;color-scheme:light}}
@@ -235,6 +265,11 @@ details.panel summary{cursor:pointer;font-weight:600}
 <div class="st" id="st">مستني الدرس...</div>
 <div class="row"><button class="btn" id="cp" disabled>انسخ الرسالة</button></div></div>
 <div class="panel"><h2>الدروس المحفوظة</h2><p class="hint">دوس على أي درس عشان تفتحه، تنسخ رسالته للـ AI، أو تمسحه.</p><input class="q" id="q" type="search" placeholder="دوّر في أسماء الدروس..."><ol id="log"></ol></div>
+<details class="panel"><summary>حفظ ملخص الدرس تلقائيًا</summary>
+<p class="hint" style="margin-top:6px">الصق إجابة المدرّس كاملة هنا، والموقع هيستخرج آخر قسم ملخص الذاكرة ويحفظه داخل الذاكرة.</p>
+<textarea id="answer" class="tall" placeholder="الصق إجابة الذكاء الاصطناعي كاملة هنا..."></textarea>
+<div class="row"><button class="btn main" id="extract">استخرج واحفظ الملخص</button></div>
+</details>
 <details class="panel"><summary>الذاكرة (ملخصاتك)</summary>
 <p class="hint" style="margin-top:6px">بتتحط في كل رسالة كـ previous knowledge.</p>
 <textarea id="mem" class="tall"></textarea><div class="row"><button class="btn main" id="sm">احفظ الذاكرة</button></div></details>
@@ -277,6 +312,19 @@ async function send(){var text=$('t').value.trim();if(busy||text.length<80)retur
 $('t').addEventListener('paste',function(){setTimeout(send,80)});$('t').addEventListener('blur',send);
 $('cp').onclick=async function(){msg('ok',(await copy(last))?'اتنسخت.':'مقدرتش أنسخ.')};
 async function save(o,ok){try{var d=await post('/api/settings',o);draw(d.state,true);msg('ok',ok)}catch(e){msg('er','الحفظ فشل.',String(e.message||e))}}
+$('extract').onclick=async function(){
+ var raw=$('answer').value.trim();
+ if(!raw){msg('er','الصق إجابة المدرّس الأول.');return}
+ try{
+  var d=await post('/api/memory/import',{text:raw});
+  draw(d.state,true);
+  $('answer').value='';
+  msg('ok',d.duplicate?'الملخص ده محفوظ بالفعل.':'تم استخراج الملخص وحفظه في الذاكرة.',d.name||'');
+ }catch(e){
+  var m=String(e.message||e);
+  msg('er',m==='summary_not_found'?'ملقيتش قسم ملخص الذاكرة. تأكد إن الإجابة فيها ### Lesson: في آخرها.':m==='lesson_exists'?'فيه ملخص بنفس اسم الدرس محفوظ بالفعل.':'تعذر حفظ الملخص.',m==='summary_not_found'||m==='lesson_exists'?'':m);
+ }
+};
 $('sm').onclick=function(){save({memory:$('mem').value},'اتحفظت الذاكرة.')};
 $('sp').onclick=function(){save({prompt:$('pr').value},'اتحفظ البرومبت.')};
 $('rp').onclick=function(){save({prompt:''},'رجع البرومبت الأصلي.')};
