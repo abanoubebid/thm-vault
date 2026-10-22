@@ -66,24 +66,30 @@ async function state(env) {
   return {
     count: keys.length,
     streak: streak(keys),
-    lessons: keys.slice().reverse().slice(0, 100).map((k) => ({ name: (k.metadata || {}).n || "?", date: (k.metadata || {}).d || "" })),
+    lessons: keys.slice().reverse().slice(0, 300).map((k) => ({ id: k.name, name: (k.metadata || {}).n || "?", date: (k.metadata || {}).d || "" })),
     prompt: (await env.KV.get("prompt")) || DEFAULT_PROMPT,
     memory: (await env.KV.get("memory")) || "",
   };
 }
 
-async function saveLesson(env, text) {
-  const keys = await listKeys(env);
-  const h = hex((await sha(text)).slice(0, 8));
+const ID_RE = /^lesson:\d{15}:[0-9a-f]{16}$/;
+
+async function buildMessage(env, text, keys, excludeName) {
   const prompt = ((await env.KV.get("prompt")) || DEFAULT_PROMPT).trim();
   const memory = ((await env.KV.get("memory")) || "").trim();
-  const dup = keys.find((k) => k.metadata && k.metadata.h === h);
-  const prev = keys.filter((k) => k !== dup);
-  const titles = prev.map((k) => "- " + (k.metadata.n || "?") + " (" + (k.metadata.d || "") + ")").join("\n");
+  const prev = keys.filter((k) => k.name !== excludeName);
+  const titles = prev.map((k) => "- " + ((k.metadata || {}).n || "?") + " (" + ((k.metadata || {}).d || "") + ")").join("\n");
   const knowledge =
     [memory, titles ? "Lessons I already studied:\n" + titles : ""].filter(Boolean).join("\n\n") ||
     "(لسه مفيش دروس سابقة، ده أول درس)";
-  const message = prompt + "\n\n<previous_knowledge>\n" + knowledge + "\n</previous_knowledge>\n\n<new_lesson>\n" + text + "\n</new_lesson>";
+  return prompt + "\n\n<previous_knowledge>\n" + knowledge + "\n</previous_knowledge>\n\n<new_lesson>\n" + text + "\n</new_lesson>";
+}
+
+async function saveLesson(env, text) {
+  const keys = await listKeys(env);
+  const h = hex((await sha(text)).slice(0, 8));
+  const dup = keys.find((k) => k.metadata && k.metadata.h === h);
+  const message = await buildMessage(env, text, keys, dup && dup.name);
   if (dup) return { name: dup.metadata.n, duplicate: true, message };
   const first = text.split("\n").find((l) => l.trim()) || "Untitled";
   const name = first.trim().replace(/^#+\s*/, "").slice(0, 80) || "Untitled";
@@ -91,18 +97,6 @@ async function saveLesson(env, text) {
   const key = "lesson:" + String(p.ms).padStart(15, "0") + ":" + h;
   await env.KV.put(key, text, { metadata: { n: name, d: p.d, t: p.t, h } });
   return { name, duplicate: false, message };
-}
-
-async function exportMd(env) {
-  const keys = (await listKeys(env)).slice(0, 400);
-  let out = "# THM Lessons\n\n";
-  for (const k of keys) {
-    const m = k.metadata || {};
-    out += "## " + (m.n || "?") + "\n- Date: " + (m.d || "") + " " + (m.t || "") + "\n\n" + ((await env.KV.get(k.name)) || "") + "\n\n---\n\n";
-  }
-  return new Response(out, {
-    headers: { "Content-Type": "text/markdown; charset=utf-8", "Content-Disposition": 'attachment; filename="thm-lessons.md"', ...SEC },
-  });
 }
 
 export default {
@@ -126,12 +120,30 @@ export default {
           },
         });
       if (req.method === "GET" && url.pathname === "/api/state") return json(await state(env));
-      if (req.method === "GET" && url.pathname === "/export.md") return await exportMd(env);
-      if (req.method === "POST" && (url.pathname === "/api/lesson" || url.pathname === "/api/settings")) {
+      if (req.method === "GET" && url.pathname === "/api/lesson") {
+        const id = url.searchParams.get("id") || "";
+        if (!ID_RE.test(id)) return json({ error: "bad id" }, 400);
+        const r = await env.KV.getWithMetadata(id);
+        if (r.value === null) return json({ error: "not found" }, 404);
+        const m = r.metadata || {};
+        return json({ name: m.n, date: m.d, time: m.t, text: r.value });
+      }
+      if (req.method === "POST" && ["/api/lesson", "/api/settings", "/api/delete", "/api/message"].includes(url.pathname)) {
         const o = req.headers.get("Origin");
         if (o && o !== url.origin) return json({ error: "forbidden" }, 403);
         if (!(req.headers.get("Content-Type") || "").startsWith("application/json")) return json({ error: "json only" }, 415);
         const body = await req.json();
+        if (url.pathname === "/api/delete" || url.pathname === "/api/message") {
+          const id = String(body.id || "");
+          if (!ID_RE.test(id)) return json({ error: "bad id" }, 400);
+          if (url.pathname === "/api/delete") {
+            await env.KV.delete(id);
+            return json({ ok: true, state: await state(env) });
+          }
+          const text = await env.KV.get(id);
+          if (text === null) return json({ error: "not found" }, 404);
+          return json({ message: await buildMessage(env, text, await listKeys(env), id) });
+        }
         if (url.pathname === "/api/lesson") {
           const text = String(body.text || "").trim();
           if (text.length < 80) return json({ error: "short" }, 400);
@@ -182,18 +194,21 @@ textarea.tall{min-height:280px}
 .btn{font:inherit;font-weight:600;font-size:.88rem;border:1px solid var(--ln);background:var(--bg);color:var(--ink);padding:6px 14px;border-radius:8px;cursor:pointer}
 .btn.main{background:var(--info);color:var(--on);border-color:var(--info)}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-ol{list-style:none;margin:6px 0 0;padding:0}li{display:flex;justify-content:space-between;gap:10px;padding:8px 2px;border-top:1px solid var(--ln);font-size:.92rem}
-li span:last-child{color:var(--mu);font-size:.82rem;white-space:nowrap}
+ol{list-style:none;margin:6px 0 0;padding:0}li{border-top:1px solid var(--ln);font-size:.92rem}
+.lh{display:flex;justify-content:space-between;gap:10px;width:100%;padding:8px 2px;background:none;border:0;color:inherit;font:inherit;text-align:inherit;cursor:pointer}
+.lh span:last-child{color:var(--mu);font-size:.82rem;white-space:nowrap}
+.lb{padding:4px 0 10px}.lb textarea{min-height:140px;max-height:260px}
+.q{width:100%;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--ln);border-radius:8px;padding:6px 10px;margin:6px 0}
 details.panel summary{cursor:pointer;font-weight:600}
 </style></head><body><main>
-<div class="top"><div class="logo mono">THM/vault</div><a href="/export.md" download>حمّل كل الدروس (ملف)</a></div>
+<div class="top"><div class="logo mono">THM/vault</div></div>
 <div class="kpis"><div class="kpi"><span>دروس محفوظة</span><b id="kc">0</b></div><div class="kpi"><span>أيام متتالية</span><b id="ks">0</b></div></div>
 <div class="panel"><h2>الصق الدرس</h2>
 <p class="hint">أول ما تلصق، الدرس بيتحفظ والرسالة للـ AI بتتنسخ.</p>
 <textarea id="t" placeholder="Paste the room content here..." autofocus></textarea>
 <div class="st" id="st">مستني الدرس...</div>
 <div class="row"><button class="btn main" id="go">احفظ</button><button class="btn" id="cp" disabled>انسخ الرسالة</button></div></div>
-<div class="panel"><h2>الدروس المحفوظة</h2><ol id="log"></ol></div>
+<div class="panel"><h2>الدروس المحفوظة</h2><p class="hint">دوس على أي درس عشان تفتحه، تنسخ رسالته للـ AI، أو تمسحه.</p><input class="q" id="q" type="search" placeholder="دوّر في أسماء الدروس..."><ol id="log"></ol></div>
 <details class="panel"><summary>الذاكرة (ملخصاتك)</summary>
 <p class="hint" style="margin-top:6px">بتتحط في كل رسالة كـ previous knowledge.</p>
 <textarea id="mem" class="tall"></textarea><div class="row"><button class="btn main" id="sm">احفظ الذاكرة</button></div></details>
@@ -202,9 +217,26 @@ details.panel summary{cursor:pointer;font-weight:600}
 <textarea id="pr" class="tall"></textarea><div class="row"><button class="btn main" id="sp">احفظ البرومبت</button><button class="btn" id="rp">رجّع الأصلي</button></div></details>
 </main><script>
 var $=function(i){return document.getElementById(i)},last='';
-function draw(s,full){$('kc').textContent=s.count;$('ks').textContent=s.streak;var o=$('log');o.innerHTML='';
- s.lessons.forEach(function(l){var li=document.createElement('li'),a=document.createElement('span'),b=document.createElement('span');a.className='mono';a.textContent=l.name;b.textContent=l.date;li.append(a,b);o.append(li)});
+var all=[];
+function draw(s,full){$('kc').textContent=s.count;$('ks').textContent=s.streak;all=s.lessons;list();
  if(full){$('mem').value=s.memory;$('pr').value=s.prompt}}
+function btn(t){var b=document.createElement('button');b.className='btn';b.textContent=t;return b}
+function list(){var q=$('q').value.trim().toLowerCase(),o=$('log');o.innerHTML='';
+ all.filter(function(l){return !q||l.name.toLowerCase().indexOf(q)>-1}).forEach(function(l){
+  var li=document.createElement('li'),h=document.createElement('button'),a=document.createElement('span'),b=document.createElement('span'),body=document.createElement('div');
+  h.className='lh';a.className='mono';a.textContent=l.name;b.textContent=l.date;h.append(a,b);body.className='lb';body.hidden=true;
+  h.onclick=function(){toggle(l,body)};li.append(h,body);o.append(li)})}
+async function toggle(l,body){
+ if(!body.hidden){body.hidden=true;return}
+ body.hidden=false;if(body.dataset.ok)return;body.textContent='...';
+ try{var r=await fetch('/api/lesson?id='+encodeURIComponent(l.id)),d=await r.json();if(!r.ok)throw new Error(d.error);
+  body.textContent='';var ta=document.createElement('textarea');ta.readOnly=true;ta.value=d.text;
+  var row=document.createElement('div');row.className='row';var c=btn('انسخ الرسالة'),x=btn('امسح');
+  c.onclick=async function(){try{var m=await post('/api/message',{id:l.id});last=m.message;$('cp').disabled=false;c.textContent=(await copy(last))?'اتنسخت ✓':'مقدرتش أنسخ'}catch(e){c.textContent='فشل'}};
+  x.onclick=async function(){if(!confirm('تمسح الدرس ده نهائي؟'))return;try{var d2=await post('/api/delete',{id:l.id});draw(d2.state,false)}catch(e){x.textContent='فشل المسح'}};
+  row.append(c,x);body.append(ta,row);body.dataset.ok='1'}
+ catch(e){body.textContent='فشل التحميل'}}
+$('q').oninput=list;
 function msg(cls,ar,en){var e=$('st');e.className='st '+cls;e.textContent='';var a=document.createElement('span');a.textContent=ar;e.append(a);if(en){var b=document.createElement('span');b.className='mono';b.textContent=en;e.append(b)}}
 async function copy(t){try{await navigator.clipboard.writeText(t);return true}catch(e){return false}}
 async function post(p,o){var r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});var d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d}
