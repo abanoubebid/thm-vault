@@ -1,0 +1,8 @@
+{
+  "name": "thm-vault",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-01",
+  "kv_namespaces": [
+    { "binding": "KV", "id": "PUT_YOUR_KV_NAMESPACE_ID_HERE" }
+  ]
+}
